@@ -1,8 +1,7 @@
-
 from django.shortcuts import render, get_object_or_404, redirect
 from django.contrib.auth.decorators import login_required
 
-from .models import Course, Question, Choice, Learner, Submission
+from .models import Course, Question, Choice, Enrollment, Submission
 
 
 def course_details(request, course_id):
@@ -15,6 +14,16 @@ def course_details(request, course_id):
     )
 
 
+def extract_answers(request):
+    selected_ids = []
+
+    for key in request.POST:
+        if key.startswith('choice_'):
+            selected_ids.append(int(request.POST[key]))
+
+    return selected_ids
+
+
 @login_required
 def submit(request, course_id):
     course = get_object_or_404(Course, id=course_id)
@@ -22,95 +31,76 @@ def submit(request, course_id):
     if request.method != 'POST':
         return redirect('course_details', course_id=course.id)
 
-    learner, created = Learner.objects.get_or_create(
-        user=request.user
+    enrollment, created = Enrollment.objects.get_or_create(
+        user=request.user,
+        course=course,
+        defaults={'mode': 'honor'}
     )
 
-    questions = Question.objects.filter(course=course)
+    submission = Submission.objects.create(
+        enrollment=enrollment
+    )
 
-    score = 0
-    total = 0
-    exam_results = []
+    selected_ids = extract_answers(request)
 
-    for question in questions:
-        total += question.grade
+    selected_choices = Choice.objects.filter(
+        id__in=selected_ids,
+        question__course=course
+    )
 
-        selected_id = request.POST.get(
-            f'question_{question.id}'
-        )
-
-        selected_choice = None
-
-        if selected_id:
-            selected_choice = Choice.objects.filter(
-                id=selected_id,
-                question=question
-            ).first()
-
-        if selected_choice:
-            Submission.objects.create(
-                learner=learner,
-                question=question,
-                choice=selected_choice
-            )
-
-        correct_choice = question.choices.filter(
-            is_correct=True
-        ).first()
-
-        is_correct = (
-            selected_choice is not None
-            and selected_choice.is_correct
-        )
-
-        if is_correct:
-            score += question.grade
-
-        exam_results.append({
-            'question': question,
-            'selected_choice': selected_choice,
-            'correct_choice': correct_choice,
-            'is_correct': is_correct,
-        })
-
-    request.session['exam_result'] = {
-        'course_name': course.name,
-        'score': score,
-        'total': total,
-        'percentage': round(score / total * 100, 2) if total else 0,
-        'results': [
-            {
-                'question': str(item['question']),
-                'selected': str(item['selected_choice'])
-                    if item['selected_choice'] else 'Not answered',
-                'correct': str(item['correct_choice'])
-                    if item['correct_choice'] else 'Not configured',
-                'is_correct': item['is_correct'],
-            }
-            for item in exam_results
-        ]
-    }
+    submission.choices.set(selected_choices)
 
     return redirect(
         'show_exam_result',
-        course_id=course.id
+        course_id=course.id,
+        submission_id=submission.id
     )
 
 
 @login_required
-def show_exam_result(request, course_id):
+def show_exam_result(request, course_id, submission_id):
     course = get_object_or_404(Course, id=course_id)
 
-    result = request.session.get('exam_result')
+    submission = get_object_or_404(
+        Submission,
+        id=submission_id,
+        enrollment__user=request.user,
+        enrollment__course=course
+    )
 
-    if not result:
-        return redirect('course_details', course_id=course.id)
+    questions = Question.objects.filter(course=course)
+
+    total_grade_points = sum(
+        question.grade for question in questions
+    )
+
+    grade = 0
+    choices = submission.choices.all()
+
+    for question in questions:
+        selected_ids = choices.filter(
+            question=question
+        ).values_list('id', flat=True)
+
+        if question.is_get_score(selected_ids):
+            grade += question.grade
+
+    percentage_score = (
+        round((grade / total_grade_points) * 100, 2)
+        if total_grade_points else 0
+    )
+
+    context = {
+        'course': course,
+        'submission': submission,
+        'grade': grade,
+        'total_grade_points': total_grade_points,
+        'percentage_score': percentage_score,
+        'choices': choices,
+    }
 
     return render(
         request,
         'onlinecourseapp/exam_result.html',
-        {
-            'course': course,
-            'result': result,
-        }
+        context
     )
